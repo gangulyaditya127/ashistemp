@@ -1,0 +1,268 @@
+import base64
+import json
+import logging
+import os
+
+from .config import settings
+
+logger = logging.getLogger(__name__)
+
+
+def gemini_invoke(system_prompt, history, message):
+    """Call LLM and return the raw response text using LiteLLM/OpenAI format."""
+    try:
+        import openai
+    except ImportError as exc:
+        raise RuntimeError(
+            "openai is not installed. Run: pip install openai"
+        ) from exc
+
+    # Fetch API Key and Base URL from environment, fallback to settings, then to defaults
+    api_key = os.getenv("LITELLM_API_KEY", settings.GEMINI_API_KEY)
+    print("---------apikey----")
+    print(api_key)
+    # if not api_key:
+    #     api_key = "sk-2HH4rgTVpz3mwaViyYy-rA"
+        
+    base_url = os.getenv("LITELLM_BASE_URL", "http://10.73.74.36:20119")
+
+    client = openai.OpenAI(
+        api_key=api_key,
+        base_url=base_url
+    )
+
+    # proxy check/bypass
+    # from .proxy_helper import configure_network
+    # configure_network()
+
+    # Convert Gemini-style history to OpenAI message format
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+
+    for msg in history:
+        role = msg.get("role", "user")
+        # Map Gemini's 'model' role to OpenAI's 'assistant' role
+        if role == "model":
+            role = "assistant"
+        messages.append({"role": role, "content": msg["text"]})
+
+    messages.append({"role": "user", "content": message})
+
+    # Override the model name to use the Vision-supported alias if the .env still has a gemini default
+    model_name = settings.LLM_MODEL or "gpt-4o-mini"
+    # if "gemini" in model_name.lower():
+    #     model_name = "gpt-5"
+
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_tokens=2000
+    )
+    return response.choices[0].message.content
+
+
+def invoke_with_image(system_prompt, image_base64, image_mime, message):
+    """Call LLM with an image for multimodal analysis using LiteLLM/OpenAI format."""
+    try:
+        import openai
+    except ImportError as exc:
+        raise RuntimeError(
+            "openai is not installed. Run: pip install openai"
+        ) from exc
+
+    api_key = os.getenv("LITELLM_API_KEY", settings.GEMINI_API_KEY)
+    # if not api_key:
+    #     api_key = "sk-2HH4rgTVpz3mwaViyYy-rA"
+
+    base_url = os.getenv("LITELLM_BASE_URL", "http://10.73.74.36:20119")
+
+    client = openai.OpenAI(
+        api_key=api_key,
+        base_url=base_url
+    )
+
+    # proxy check/bypass
+    # from .proxy_helper import configure_network
+    # configure_network()
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+
+    messages.append({
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": message
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{image_mime};base64,{image_base64}"
+                }
+            }
+        ]
+    })
+
+    model_name = settings.LLM_MODEL or "gpt-4o-mini"
+    # if "gemini" in model_name.lower():
+    #     model_name = "gpt-5"
+    print("----model name----")
+    print(model_name)
+    logger.debug(
+        "invoke_with_image — model=%s mime=%s",
+        model_name, image_mime,
+    )
+
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_tokens=2000
+    )
+    print("----llm_response in invoke_with_image--------------")
+    print(response.choices[0].message.content)
+    print(response)
+    return response.choices[0].message.content
+
+
+def invoke(system_prompt, history, message):
+    """Public dispatch — call LLM."""
+    logger.debug("LLM invoke — model=%s history_turns=%d", settings.LLM_MODEL, len(history))
+    return gemini_invoke(system_prompt, history, message)
+
+
+def analyze_incident(incident_details, activities, image_attachments, resolution_notes):
+    """Orchestrate LLM analysis of an incident.
+
+    Returns a dict with:
+      - journals_summary: summary of work notes/comments
+      - audit_summary: summary of field changes
+      - image_analysis: analysis of image attachments
+      - recommended_resolution: recommended resolution note
+      - raw_response: the full LLM response
+    """
+    # --- Step 1: Analyze images (if any) ---
+    image_descriptions = []
+    for img in image_attachments:
+        try:
+            desc = invoke_with_image(
+                system_prompt=(
+                    "You are an IT incident analyst. Analyze this screenshot/image "
+                    "attached to an IT incident ticket. Describe what you see — errors, "
+                    "logs, UI states, configurations, error codes, stack traces, or any "
+                    "relevant technical details. Be concise but thorough."
+                ),
+                image_base64=img["base64"],
+                image_mime=img["content_type"],
+                message=f"Describe this image attached to incident. Filename: {img['file_name']}",
+            )
+            image_descriptions.append({
+                "file_name": img["file_name"],
+                "description": desc,
+            })
+        except Exception as e:
+            logger.warning("Failed to analyze image %s: %s", img["file_name"], e)
+            image_descriptions.append({
+                "file_name": img["file_name"],
+                "description": f"[Analysis failed: {str(e)}]",
+            })
+
+    # --- Step 2: Build the main analysis prompt ---
+    system_prompt = (
+        "You are an expert IT Service Management (ITSM) analyst. You analyze incident "
+        "tickets from ServiceNow and provide structured resolution recommendations.\n\n"
+        "Your output MUST be in the following JSON format (and nothing else):\n"
+        "{\n"
+        '  "journals_summary": "A concise summary of all work notes and comments...",\n'
+        '  "audit_summary": "A summary of key field changes (state transitions, reassignments, priority changes)...",\n'
+        '  "image_analysis": "Combined analysis of all image attachments...",\n'
+        '  "recommended_resolution": "A detailed, professional resolution note suitable for closing this incident..."\n'
+        "}\n\n"
+        "Guidelines for the recommended_resolution:\n"
+        "- Summarize the root cause\n"
+        "- Describe the fix/workaround applied\n"
+        "- Note any follow-up actions or preventive measures\n"
+        "- Be professional and concise\n"
+        "- If resolution notes already exist, improve and enhance them\n"
+    )
+
+    # Build context message
+    context_parts = []
+
+    # Incident details
+    context_parts.append("=== INCIDENT DETAILS ===")
+    for key, value in incident_details.items():
+        if value and key not in ("sys_id", "is_resolved", "resolution_notes"):
+            context_parts.append(f"{key}: {value}")
+
+    # Activities
+    context_parts.append("\n=== ACTIVITY TIMELINE ===")
+    journals = [a for a in activities if a["type"] in ("work_note", "comment")]
+    field_changes = [a for a in activities if a["type"] == "field_change"]
+    attachments_list = [a for a in activities if a["type"] == "attachment"]
+
+    if journals:
+        context_parts.append("\n--- Work Notes & Comments ---")
+        for j in journals:
+            context_parts.append(
+                f"[{j['created_on']}] ({j['type']}) by {j['created_by']}: {j['note']}"
+            )
+
+    if field_changes:
+        context_parts.append("\n--- Field Changes (Audit) ---")
+        for fc in field_changes:
+            context_parts.append(
+                f"[{fc['created_on']}] {fc['field']}: '{fc['old_value']}' → '{fc['new_value']}' by {fc['created_by']}"
+            )
+
+    if attachments_list:
+        context_parts.append("\n--- Attachments ---")
+        for att in attachments_list:
+            context_parts.append(
+                f"[{att['created_on']}] {att['file_name']} ({att['content_type']}, {att['size']} bytes) by {att['created_by']}"
+            )
+
+    # Image descriptions
+    if image_descriptions:
+        context_parts.append("\n--- Image Analysis ---")
+        for img_desc in image_descriptions:
+            context_parts.append(f"Image '{img_desc['file_name']}': {img_desc['description']}")
+
+    # Resolution notes
+    if resolution_notes:
+        context_parts.append(f"\n=== EXISTING RESOLUTION NOTES ===\n{resolution_notes}")
+
+    context_parts.append(
+        "\n=== TASK ===\n"
+        "Based on all the above information, provide your analysis in the JSON format specified."
+    )
+
+    message = "\n".join(context_parts)
+
+    # Call LLM
+    raw_response = invoke(system_prompt, [], message)
+
+    # Parse JSON from response
+    try:
+        # Try to extract JSON from the response (handle markdown code blocks)
+        json_str = raw_response
+        print("----json_str-------------------------")
+        print(json_str)
+        if "```json" in json_str:
+            json_str = json_str.split("```json").split("```")
+        elif "```" in json_str:
+            json_str = json_str.split("```").split("```")
+        parsed = json.loads(json_str.strip())
+    except (json.JSONDecodeError, IndexError):
+        logger.warning("Failed to parse LLM JSON response, returning raw")
+        parsed = {
+            "journals_summary": "Analysis could not be structured. See raw response.",
+            "audit_summary": "",
+            "image_analysis": "",
+            "recommended_resolution": raw_response,
+        }
+
+    parsed["raw_response"] = raw_response
+    return parsed
